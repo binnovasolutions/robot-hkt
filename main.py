@@ -17,18 +17,12 @@ ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID")
 
 # ==========================================
 # ⚙️ CẤU HÌNH ELEVENLABS
-# (Lưu ý: ElevenLabs không hỗ trợ tham số "speed" qua API. 
-# Tốc độ đọc phụ thuộc vào Voice ID và dấu câu)
 # ==========================================
 ELEVENLABS_MODEL = "eleven_flash_v2_5" 
-ELEVENLABS_STABILITY = 0.35      # Hạ xuống 0.35 để giọng có cảm xúc, lên xuống tự nhiên hơn
-ELEVENLABS_SIMILARITY = 0.85     # Tăng nhẹ để bám sát bản sao giọng gốc
-ELEVENLABS_STYLE = 0.4           # Thêm Style (0.0 đến 1.0) để phóng đại biểu cảm, giúp giọng tươi vui hơn
-ELEVENLABS_SPEAKER_BOOST = True  # Kích hoạt để làm rõ và trong giọng đọc
-# ==========================================
-
-if not DEEPGRAM_API_KEY or not OPENAI_API_KEY or not ELEVENLABS_API_KEY:
-    print(f"[{time.strftime('%H:%M:%S')}] ⚠️ LỖI: Thiếu API Key trong file .env")
+ELEVENLABS_STABILITY = 0.35      
+ELEVENLABS_SIMILARITY = 0.85     
+ELEVENLABS_STYLE = 0.4           
+ELEVENLABS_SPEAKER_BOOST = True  
 
 app = FastAPI()
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
@@ -48,78 +42,71 @@ async def keep_deepgram_alive(dg_socket, client_websocket, session_state):
     try:
         keepalive_count = 0
         bot_working_keepalive_timer = 0
-        
         while True:
-            await asyncio.sleep(1) # Kiểm tra mỗi giây
+            await asyncio.sleep(1) 
             
-            # TRƯỜNG HỢP 1: Bot đang suy nghĩ/nói -> Bỏ qua đếm ngược idle
-            # Đã bao gồm cả thời gian Frontend đang phát âm thanh qua loa
             if session_state.get("is_bot_working", False):
                 bot_working_keepalive_timer += 1
                 if bot_working_keepalive_timer >= 5:
                     await dg_socket.send(json.dumps({"type": "KeepAlive"}))
                     bot_working_keepalive_timer = 0
-                
                 session_state["last_audio_time"] = time.time()
                 keepalive_count = 0
                 continue
 
-            # TRƯỜNG HỢP 2: Đếm ngược im lặng thực sự
             bot_working_keepalive_timer = 0
             idle_time = time.time() - session_state.get("last_audio_time", time.time())
             
             if idle_time >= 20:
-                print(f"\n[{time.strftime('%H:%M:%S')}] ⏱️ Đã quá 20s không có tiếng nói. Backend chủ động đóng phiên làm việc!")
+                print(f"\n[{time.strftime('%H:%M:%S')}] ⏱️ [TIMEOUT] Quá 20s không có tiếng nói. Đóng phiên!")
                 try:
-                    # Gửi tín hiệu để Frontend tự tắt Mic và đóng kết nối
                     await client_websocket.send_json({"type": "control", "event": "deepgram_timeout"})
-                    # Đóng Deepgram
                     await dg_socket.close()
-                    # Cấp cho Frontend 0.5s để nó tự đóng kết nối, nếu nó không đóng thì Backend ép đóng
                     await asyncio.sleep(0.5) 
                     await client_websocket.close()
                 except Exception:
                     pass
-                break # Thoát luồng
+                break 
 
             elif idle_time >= 10 and keepalive_count == 1:
                 await dg_socket.send(json.dumps({"type": "KeepAlive"}))
-                print(f"[{time.strftime('%H:%M:%S')}] 📡 Đã gửi tín hiệu KeepAlive lần 2 (Chuẩn bị đóng nếu im lặng)...")
                 keepalive_count = 2
             elif idle_time >= 5 and keepalive_count == 0:
                 await dg_socket.send(json.dumps({"type": "KeepAlive"}))
-                print(f"[{time.strftime('%H:%M:%S')}] 📡 Đã gửi tín hiệu KeepAlive lần 1 (Giữ kết nối Deepgram)...")
                 keepalive_count = 1
             elif idle_time < 5:
                 keepalive_count = 0
-
     except asyncio.CancelledError:
         pass
     except Exception as e:
-        pass 
+        print(f"[{time.strftime('%H:%M:%S')}] ⚠️ Lỗi KeepAlive: {e}")
 
 async def deepgram_receiver(dg_socket, client_websocket, session_state):
-    """Luồng chạy ngầm nhận text từ Deepgram và gửi về Web"""
+    """Luồng chạy ngầm nhận text từ Deepgram và gửi về Web (ĐÃ VÁ LỖI)"""
+    print(f"[{time.strftime('%H:%M:%S')}] 👂 [DEEPGRAM] Bắt đầu lắng nghe kết quả từ Deepgram...")
     try:
         async for message in dg_socket:
-            res = json.loads(message)
-            if isinstance(res, dict) and "channel" in res:
-                channel = res.get("channel", {})
-                if isinstance(channel, dict):
+            try: # Bọc try-except bên trong vòng lặp để bảo vệ luồng không bị sập
+                res = json.loads(message)
+                
+                # Kiểm tra chặt chẽ: gói tin phải là dictionary và có chứa key 'channel' dạng dictionary
+                if isinstance(res, dict) and "channel" in res and isinstance(res["channel"], dict):
+                    channel = res["channel"]
                     alternatives = channel.get("alternatives", [])
-                    if isinstance(alternatives, list) and len(alternatives) > 0:
+                    
+                    if alternatives and isinstance(alternatives, list) and len(alternatives) > 0:
                         sentence = alternatives[0].get("transcript", "")
                         is_final = res.get("is_final", False)
                         
                         if sentence:
-                            # Chỉ reset đồng hồ khi Deepgram THỰC SỰ nghe thấy chữ
                             session_state["last_audio_time"] = time.time()
                             
                             if is_final:
-                                print(f"[{time.strftime('%H:%M:%S')}] ✅ Deepgram (Chốt câu): {sentence}")
+                                print(f"\n[{time.strftime('%H:%M:%S')}] ✅ [DEEPGRAM-CHỐT]: '{sentence}'")
                                 session_state["final_transcript"] += sentence + " "
                                 session_state["interim_transcript"] = "" 
                             else:
+                                print(f"\r[{time.strftime('%H:%M:%S')}] ⏳ [DEEPGRAM-TẠM]: '{sentence}'", end="", flush=True)
                                 session_state["interim_transcript"] = sentence
 
                             await client_websocket.send_text(json.dumps({
@@ -127,17 +114,19 @@ async def deepgram_receiver(dg_socket, client_websocket, session_state):
                                 "text": sentence,
                                 "is_final": is_final
                             }))
-    except websockets.exceptions.ConnectionClosed:
-        pass
-    except asyncio.CancelledError:
-        pass
+            except Exception as parse_err:
+                # Bỏ qua các gói tin VAD Control Message lạ
+                continue 
+
     except Exception as e:
-        print(f"[{time.strftime('%H:%M:%S')}] ⚠️ Lỗi luồng nhận Deepgram: {e}")
+        print(f"\n[{time.strftime('%H:%M:%S')}] 🔴 [DEEPGRAM-LỖI NGHIÊM TRỌNG] Luồng nhận bị đóng: {e}")
 
 async def elevenlabs_tts_worker(tts_queue, client_websocket):
     uri = f"wss://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}/stream-input?model_id={ELEVENLABS_MODEL}&output_format=pcm_16000"
+    print(f"[{time.strftime('%H:%M:%S')}] 🗣️ [ELEVENLABS] Đang kết nối TTS WebSocket...")
     try:
         async with websockets.connect(uri) as el_socket:
+            print(f"[{time.strftime('%H:%M:%S')}] 🗣️ [ELEVENLABS] Đã kết nối thành công. Đang chờ text chunk...")
             init_msg = {
                 "text": " ",
                 "voice_settings": {
@@ -154,31 +143,38 @@ async def elevenlabs_tts_worker(tts_queue, client_websocket):
                 while True:
                     text_chunk = await tts_queue.get()
                     if text_chunk is None:
+                        print(f"\n[{time.strftime('%H:%M:%S')}] 🗣️ [ELEVENLABS] Đã nhận tín hiệu KẾT THÚC câu.")
                         await el_socket.send(json.dumps({"text": ""}))
                         break
                     if text_chunk.strip():
+                        print(f"[{time.strftime('%H:%M:%S')}] 🗣️ [ELEVENLABS] Đang chuyển thành giọng nói đoạn: '{text_chunk}'")
                         await el_socket.send(json.dumps({
                             "text": text_chunk, 
                             "try_trigger_generation": True
                         }))
 
             async def receiver():
+                audio_chunk_count = 0
                 async for message in el_socket:
                     data = json.loads(message)
                     if data.get("audio"):
+                        audio_chunk_count += 1
+                        if audio_chunk_count % 5 == 0:
+                            print(f"[{time.strftime('%H:%M:%S')}] 🎵 [ELEVENLABS] Đang gửi Audio xuống Client (Chunk {audio_chunk_count})...")
                         audio_bytes = base64.b64decode(data["audio"])
                         await client_websocket.send_bytes(audio_bytes)
                     if data.get("isFinal"):
+                        print(f"[{time.strftime('%H:%M:%S')}] 🎵 [ELEVENLABS] Đã gửi XONG toàn bộ Audio gói này!")
                         break
 
             await asyncio.gather(sender(), receiver())
     except Exception as e:
-        print(f"[{time.strftime('%H:%M:%S')}] ❌ Lỗi ElevenLabs TTS: {e}")
+        print(f"\n[{time.strftime('%H:%M:%S')}] ❌ [ELEVENLABS-LỖI]: {e}")
 
 @app.websocket("/ws")
 async def websocket_endpoint(client_websocket: WebSocket):
     await client_websocket.accept()
-    print(f"[{time.strftime('%H:%M:%S')}] 🟢 Client đã kết nối!")
+    print(f"\n{'='*50}\n[{time.strftime('%H:%M:%S')}] 🟢 [CLIENT] Web Frontend đã kết nối!\n{'='*50}")
     
     sys_prompt = get_system_prompt()
     session_state = {
@@ -198,9 +194,10 @@ async def websocket_endpoint(client_websocket: WebSocket):
     )
     headers = {"Authorization": f"Token {DEEPGRAM_API_KEY}"}
     
+    byte_count = 0
     try:
         dg_socket = await websockets.connect(dg_url, additional_headers=headers)
-        print(f"[{time.strftime('%H:%M:%S')}] 🔗 Đã kết nối với Deepgram STT!")
+        print(f"[{time.strftime('%H:%M:%S')}] 🔗 [SERVER] Đã kết nối với Deepgram STT!")
         
         receiver_task = asyncio.create_task(deepgram_receiver(dg_socket, client_websocket, session_state))
         keepalive_task = asyncio.create_task(keep_deepgram_alive(dg_socket, client_websocket, session_state))
@@ -210,18 +207,26 @@ async def websocket_endpoint(client_websocket: WebSocket):
             
             # XỬ LÝ AUDIO TỪ WEB LÊN DEEPGRAM
             if "bytes" in message:
+                byte_count += 1
+                if byte_count == 1:
+                    print(f"\n[{time.strftime('%H:%M:%S')}] 🎤 [CLIENT->SERVER] Bắt đầu nhận luồng âm thanh PCM...")
+                elif byte_count % 100 == 0:
+                    print(".", end="", flush=True) 
+                
                 try:
                     await dg_socket.send(message["bytes"])
                 except websockets.exceptions.ConnectionClosed:
+                    print(f"\n[{time.strftime('%H:%M:%S')}] ⚠️ [DEEPGRAM] Kết nối gửi Audio bị đóng!")
                     break
 
             # XỬ LÝ ĐIỀU KHIỂN & GỌI LLM
             elif "text" in message:
                 data = json.loads(message["text"])
+                print(f"\n[{time.strftime('%H:%M:%S')}] 📩 [CLIENT->SERVER] Tín hiệu JSON: {data}")
 
-                # --- 1. NGƯỜI DÙNG NÓI XONG, YÊU CẦU TRẢ LỜI ---
                 if data.get("type") == "control" and data.get("event") == "end_of_speech":
-                    session_state["is_bot_working"] = True # Bắt đầu khóa bộ đếm idle
+                    byte_count = 0 
+                    session_state["is_bot_working"] = True
                     await client_websocket.send_json({"type": "status", "state": "thinking"})
                     
                     user_text = (session_state["final_transcript"] + session_state["interim_transcript"]).strip()
@@ -229,23 +234,26 @@ async def websocket_endpoint(client_websocket: WebSocket):
                     session_state["interim_transcript"] = ""
                     
                     if not user_text:
+                        print(f"[{time.strftime('%H:%M:%S')}] ⚠️ [LLM] Không có text. Hủy bỏ!")
                         session_state["is_bot_working"] = False
                         session_state["last_audio_time"] = time.time()
                         await client_websocket.send_json({"type": "status", "state": "idle"})
                         continue
                     
-                    print(f"\n[{time.strftime('%H:%M:%S')}] 🧠 Hỏi LLM: {user_text}")
+                    print(f"[{time.strftime('%H:%M:%S')}] 🧠 [LLM] Chuẩn bị gửi câu hỏi tới OpenAI: '{user_text}'")
                     messages = session_state["history"] + [{"role": "user", "content": user_text}]
                     
                     try:
+                        llm_model = "gpt-4o-mini" # Sử dụng model tiêu chuẩn để tránh lỗi API
+                        
                         stream = await openai_client.chat.completions.create(
-                            model="gpt-5.4-nano", 
+                            model=llm_model, 
                             messages=messages,
                             stream=True
                         )
                         
                         await client_websocket.send_json({"type": "status", "state": "speaking"})
-                        print(f"[{time.strftime('%H:%M:%S')}] 🤖 Trả lời: ", end="", flush=True)
+                        print(f"[{time.strftime('%H:%M:%S')}] 🤖 [LLM-TEXT]: ", end="", flush=True)
                         
                         tts_queue = asyncio.Queue()
                         tts_task = asyncio.create_task(elevenlabs_tts_worker(tts_queue, client_websocket))
@@ -269,44 +277,34 @@ async def websocket_endpoint(client_websocket: WebSocket):
                             await tts_queue.put(buffer)
                             
                         await tts_queue.put(None)
+                        print(f"\n[{time.strftime('%H:%M:%S')}] 🧠 [LLM] Sinh text hoàn tất! Đang đợi ElevenLabs...")
                         await tts_task
                         
-                        print(f"\n[{time.strftime('%H:%M:%S')}] ✅ Server đã tạo xong luồng Audio!")
-                        
-                        # Chỉ báo cho Frontend là Audio đã tải xong. KHÔNG set idle ở đây nữa.
+                        print(f"[{time.strftime('%H:%M:%S')}] ✅ [SERVER] Đã hoàn thành toàn bộ Pipeline cho câu hỏi này!")
                         await client_websocket.send_json({"type": "status", "state": "speaking_done"})
                         
-                        # Cập nhật lịch sử
                         session_state["history"].append({"role": "user", "content": user_text})
                         session_state["history"].append({"role": "assistant", "content": llm_response})
                         
                         if len(session_state["history"]) > 11:
                             session_state["history"] = [session_state["history"][0]] + session_state["history"][-10:]
-                            print(f"[{time.strftime('%H:%M:%S')}] 🧹 Đã dọn dẹp bộ nhớ: Giữ lại System Prompt và 10 tin nhắn gần nhất.")
                             
                     except Exception as llm_err:
-                        print(f"\n[{time.strftime('%H:%M:%S')}] ❌ Lỗi OpenAI/TTS: {llm_err}")
-                        # Nếu lỗi thì xả cờ idle luôn để không bị treo
+                        print(f"\n[{time.strftime('%H:%M:%S')}] ❌ [LLM/OPENAI LỖI]: {llm_err}")
                         session_state["is_bot_working"] = False
                         session_state["last_audio_time"] = time.time()
                         await client_websocket.send_json({"type": "status", "state": "idle"})
                 
-                # --- 2. FRONTEND BÁO CÁO: ĐÃ PHÁT XONG ÂM THANH QUA LOA ---
                 elif data.get("type") == "control" and data.get("event") == "playback_completed":
                     session_state["is_bot_working"] = False
-                    session_state["last_audio_time"] = time.time() # Bắt đầu đếm 20s TỪ ĐÂY
+                    session_state["last_audio_time"] = time.time()
                     await client_websocket.send_json({"type": "status", "state": "idle"})
-                    print(f"[{time.strftime('%H:%M:%S')}] 🔊 Frontend đã phát xong Audio. Bắt đầu đếm giờ chờ...")
+                    print(f"[{time.strftime('%H:%M:%S')}] 🔊 [CLIENT] Frontend đã phát xong Audio. Chuyển về IDLE.")
 
     except WebSocketDisconnect:
-        print(f"\n[{time.strftime('%H:%M:%S')}] 🔴 Client đã chủ động ngắt kết nối!")
-    except RuntimeError as e:
-        if "Cannot call" in str(e):
-            print(f"[{time.strftime('%H:%M:%S')}] 🔌 Đã đóng luồng WebSocket an toàn.")
-        else:
-            print(f"[{time.strftime('%H:%M:%S')}] ❌ Lỗi Runtime WebSocket: {e}")
+        print(f"\n[{time.strftime('%H:%M:%S')}] 🔴 [CLIENT] Đã chủ động ngắt kết nối WebSocket!")
     except Exception as e:
-        print(f"[{time.strftime('%H:%M:%S')}] ❌ Lỗi WebSocket: {e}")
+        print(f"[{time.strftime('%H:%M:%S')}] ❌ [SERVER LỖI TỔNG]: {e}")
     finally:
         if 'receiver_task' in locals():
             receiver_task.cancel()
@@ -318,7 +316,5 @@ async def websocket_endpoint(client_websocket: WebSocket):
 
 if __name__ == "__main__":
     import uvicorn
-    import os
-    # Lấy cổng từ biến môi trường của hệ thống, mặc định là 8030 nếu không tìm thấy
     port = int(os.getenv("PORT", 8030))
     uvicorn.run("main:app", host="0.0.0.0", port=port)
